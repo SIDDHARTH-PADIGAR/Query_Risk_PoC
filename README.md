@@ -1,36 +1,75 @@
 # **Query Risk Scoring System — PoC**
 
-A lightweight control-plane microservice that scores SQL queries for execution risk using:
+A lightweight microservice that scores SQL queries for **execution risk** before they hit the compute engine.
+It analyzes SQL structure, estimates potential compute cost, runs an ML model, applies safety rules, and returns a clean JSON output.
 
-* metadata extraction
-* a trained XGBoost model
-* SHAP interpretability
-* rule-based overrides for catastrophic patterns
-
-Designed to integrate into a lakehouse engine’s pre-execution workflow.
+Built to mimic a real pre-execution guardrail inside a lakehouse engine.
 
 ---
 
-## **System Architecture**
+# **1. What This Service Does (Short + Clear)**
 
-### **Query Risk Scoring Flow**
+When you send a SQL query, the service returns:
+
+* **risk level:**
+  `0 = low`, `1 = medium`, `2 = high`
+
+* **probabilities:** model confidence
+
+* **metadata:** what the query structurally looks like
+
+* **shap:** why the model made its prediction (if model used)
+
+* **rule overrides:** force HIGH for catastrophic patterns
+
+This is how control planes decide **resource allocation**, **warnings**, or **blocks**.
+
+---
+
+# **2. Quick User Flow (Simple + Understandable)**
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart LR
+
+A[User submits SQL] --> B[Query sent to Risk Service]
+
+B --> C[Metadata Extractor<br/>Parse SQL → numbers, counts, sizes]
+C --> D[Model<br/>Predict low/med/high]
+
+D --> E[SHAP<br/>Explain why (model-only)]
+C -->|Catastrophic pattern| F[Rule Override<br/>Force High]
+
+E --> G[Build JSON Response]
+F --> G
+D --> G
+C --> G
+
+G --> H[Return risk score + metadata + explanations]
+```
+
+This is the real pipeline engines use.
+
+---
+
+# **3. System Architecture (Microservice)**
 
 ```mermaid
 %%{init: {'theme':'dark'}}%%
 graph TB
     Client[Client/Portal]
-    
+
     subgraph API["Query-Risk Service"]
-        POST[HTTP POST /score<br/>Request Body]
-        ME[Metadata Extractor<br/>Parse SQL → Features]
-        Model[ML Model<br/>XGBoost + Calibration]
-        Explainer[SHAP Explainer<br/>Feature Contributions]
-        Response[JSON Response]
+        POST[HTTP POST /score]
+        ME[Metadata Extractor]
+        Model[XGBoost Model<br/>+ Calibration]
+        Explainer[SHAP Explainer]
+        Response[Response Builder]
     end
-    
-    Output["JSON Response<br/>{prediction, proba[], metadata{}, shap{}}"]
-    
-    Client -->|HTTPS POST| POST
+
+    Output["JSON Response"]
+
+    Client --> POST
     POST --> ME
     ME --> Model
     Model --> Explainer
@@ -43,32 +82,31 @@ graph TB
 
 ---
 
-### **Integration in Control Plane**
+# **4. How It Fits Into a Control Plane**
 
 ```mermaid
 %%{init: {'theme':'dark'}}%%
 graph TB
     User[User SQL UI]
-    Gateway[Control Plane / Gateway]
-    Risk[Query-Risk Service]
-    
+    Gateway[Control Plane Gateway]
+    Risk[Query-Risk Microservice]
+
     Planner[Execution Planner]
     Engine[Execution Engine]
-    Storage[S3 / ADLS / GCS]
-    
+    Storage[Object Storage]
+
     Telemetry[Telemetry]
     Obs[Observability Pipeline]
     Store[Datastore]
-    
+
     User --> Gateway
-    Gateway -->|Pre-exec Hook| Risk
-    
-    Risk -->|High Risk → Warn/Block| Gateway
-    Risk -->|Safe → Pass| Planner
-    
+    Gateway --> Risk
+    Risk -->|High: warn/block| Gateway
+    Risk -->|Safe| Planner
+
     Planner --> Engine
     Engine --> Storage
-    
+
     Planner --> Telemetry
     Telemetry --> Obs
     Obs --> Store
@@ -76,39 +114,47 @@ graph TB
 
 ---
 
-## **What the Service Returns**
+# **5. What Metadata Means (Quick + Clear)**
 
-* **risk level:** `0 (low)`, `1 (medium)`, `2 (high)`
-* **probabilities:** calibrated P(low/med/high)
-* **metadata:** extracted SQL structure + estimated costs
-* **shap:** per-feature contribution (or null if rule override fires)
+Example:
 
----
+```json
+{
+  "estimated_join_output": 10000000
+}
+```
 
-## **Rule Overrides**
+**Meaning:**
+“If this join runs, expect ~10 million rows created during the join step.”
 
-Hard, non-negotiable safety checks:
+This drives:
 
-* **Cartesian join → risk = 2**
-* **Large table + SELECT * → risk = 2**
-* **Extreme fan-out indicators → risk = 2**
+* memory needed
+* shuffle load
+* network cost
+* engine scaling decisions
+* risk score
 
-These take priority over the model.
-
----
-
-## **Feature Set**
-
-Metadata extractor generates:
-
-* structural features (joins, tables, filters, subqueries, depth)
-* cost features (table size, join output, output rows, sort cost)
-* compute pressure signals (shuffle, skew, memory)
-* operators (aggregates, windows, UDFs, select star)
+Other fields follow the same idea:
+numbers that hint at **how much work the engine will do**.
 
 ---
 
-## **Running the PoC**
+# **6. Rule Overrides (Non-negotiable Safety)**
+
+The model can be wrong. Some patterns are too dangerous.
+
+Hard-coded overrides:
+
+* **Cartesian join → HIGH**
+* **Huge SELECT * scan → HIGH**
+* **Extreme fan-out → HIGH**
+
+These run before the model output is returned.
+
+---
+
+# **7. Running the PoC**
 
 Train:
 
@@ -130,7 +176,7 @@ streamlit run app_streamlit.py
 
 ---
 
-## **Repo Structure**
+# **8. Repo Structure**
 
 ```
 metadata_extractor.py
@@ -144,7 +190,7 @@ README.md
 
 ---
 
-## **Example Output**
+# **9. Example Output**
 
 ```json
 {
@@ -187,3 +233,18 @@ README.md
   "shap": null
 }
 ```
+
+Translation:
+
+* Found a cartesian join
+* Estimated 10M row explosion
+* Overrode the model
+* Forced HIGH risk
+* SHAP is null (model wasn’t used)
+
+---
+
+# **10. Done**
+
+This PoC behaves like a **real control-plane guardrail**:
+
