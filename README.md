@@ -7,7 +7,7 @@ Built to mimic a real pre-execution guardrail inside a lakehouse engine.
 
 ---
 
-# **1. What This Service Does (Short + Clear)**
+# **1. What This Service Does**
 
 When you send a SQL query, the service returns:
 
@@ -26,7 +26,7 @@ This is how control planes decide **resource allocation**, **warnings**, or **bl
 
 ---
 
-# **2. Quick User Flow (Simple + Understandable)**
+# **2. Quick User Flow**
 
 ```mermaid
 %%{init: {'theme':'neutral'}}%%
@@ -114,7 +114,7 @@ graph TB
 
 ---
 
-# **5. What Metadata Means (Quick + Clear)**
+# **5. What Metadata Means**
 
 Example:
 
