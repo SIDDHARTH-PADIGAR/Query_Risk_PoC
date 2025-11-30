@@ -243,9 +243,4 @@ Translation:
 * Forced HIGH risk
 * SHAP is null (model wasn’t used)
 
----
-
-# **10. Done**
-
-This PoC behaves like a **real control-plane guardrail**:
 
