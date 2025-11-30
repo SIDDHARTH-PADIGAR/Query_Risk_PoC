@@ -34,18 +34,19 @@ flowchart LR
 
 A[User submits SQL] --> B[Query sent to Risk Service]
 
-B --> C[Metadata Extractor<br/>Parse SQL → numbers, counts, sizes]
-C --> D[Model<br/>Predict low/med/high]
+B --> C[Metadata Extractor<br/>Parse SQL → features]
+C --> D[Model<br/>Predict low / medium / high]
 
-D --> E[SHAP<br/>Explain why (model-only)]
-C -->|Catastrophic pattern| F[Rule Override<br/>Force High]
+D --> E[SHAP Explainer<br/>Model-only explanations]
+C -->|Catastrophic pattern detected| F[Rule Override<br/>Force High Risk]
 
 E --> G[Build JSON Response]
 F --> G
 D --> G
 C --> G
 
-G --> H[Return risk score + metadata + explanations]
+G --> H[Return: risk score + probabilities + metadata + SHAP]
+
 ```
 
 This is the real pipeline engines use.
