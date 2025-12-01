@@ -1,242 +1,213 @@
-# **Query Risk Scoring — PoC for e6data**
+# **Query Risk Scoring — e6data PoC**
 
-A lightweight pre-execution risk scoring system that predicts the cost impact of an incoming SQL query before it reaches the execution engine.
-The goal: **identify expensive queries early**, flag unsafe patterns (Cartesian joins, massive scans, SELECT * on huge tables), and return a **Low / Medium / High** risk score with an explanation.
+A lightweight **pre-execution SQL risk detector** that evaluates incoming queries using a hybrid of:
 
-This PoC evaluates a SQL string and produces:
+* **Static metadata extraction**
+* **Structured rule overrides (guaranteed safety)**
+* **A calibrated ML classifier**
+* **Optional SHAP explainability**
 
-* Risk level (0 = Low, 1 = Medium, 2 = High)
-* Probability distribution
-* Extracted metadata (joins, table sizes, filters, windows, subqueries…)
-* SHAP-based interpretability (model-based reasoning)
-* Hard safety overrides (critical patterns → forced High)
-
-Powered by: **Metadata extraction → ML model → Rule-layer overrides**.
+The goal: give the engine an early warning signal so it can **avoid runaway compute, prevent cluster blowups, and auto-route or block unsafe SQL** before execution.
 
 ---
 
-# **1. How It Works**
+## **1. What This PoC Does**
 
-### **Core Pipeline**
+* Parses SQL and extracts structural + cost-hint metadata
+* Scores every query as **Low / Medium / High Risk**
+* Applies **hard safety rules** for catastrophic patterns:
 
-1. User submits a SQL query
-2. Metadata extractor parses structural and cost-related signals
-3. Model predicts risk (XGBoost + calibration)
-4. SHAP explains model reasoning (where applicable)
-5. Rule engine enforces mandatory red flags
-6. System returns a structured JSON response
+  * Cartesian join
+  * Huge table + SELECT *
+  * Multi-level nesting
+* Returns:
 
-Fast (<50ms), deterministic, and production-aligned with the way e6data evaluates query cost internally.
+  * prediction
+  * probability vector
+  * extracted metadata
+  * SHAP attributions (when available)
 
----
-
-# **2. User Flow**
-
-```mermaid
-%%{init: {'theme':'neutral'}}%%
-flowchart LR
-
-A[User submits SQL] --> B[Query sent to Risk Service]
-
-B --> C[Metadata Extractor<br/>Parse SQL → counts, sizes, joins]
-C --> D[ML Model<br/>Predict Low / Med / High]
-
-%% SHAP and rules
-D --> E[SHAP Explainer<br/>Model-only explanation]
-C -->|Critical pattern| F[Rule Override<br/>Force High]
-
-%% Response assembly
-E --> G[JSON Response Builder]
-F --> G
-D --> G
-C --> G
-
-G --> H[Return risk score + metadata + explanation]
-```
+This runs in **milliseconds**, making it viable for a live preflight hook.
 
 ---
 
-# **3. System Architecture**
+## **2. Architecture Overview**
 
-### **A. Query Risk Scoring System (Standalone)**
+### **Query-Risk Scoring Flow**
 
 ```mermaid
 %%{init: {'theme':'dark'}}%%
 graph TB
-    Client[Client / Portal]
-
+    Client[Client/Portal]
+    
     subgraph API["Query-Risk Service"]
-        POST[POST /score]
-        ME[Metadata Extractor]
-        Model[ML Model<br/>XGBoost + Calibrator]
-        Explainer[SHAP Explainer]
-        Response[JSON Builder]
+        POST[HTTP POST /score<br/>Request Body]
+        ME[Metadata Extractor<br/>---<br/>Parse request features<br/>Extract context data]
+        Model[ML Model<br/>---<br/>XGBoost Classifier<br/>+ Calibration Layer]
+        Explainer[SHAP Explainer<br/>---<br/>Feature contributions]
+        Response[JSON Response Builder]
     end
-
-    Output["JSON Response"]
-
-    Client -->|POST SQL| POST
+    
+    Output["JSON Response<br/>{ prediction, proba[], metadata, shap }"]
+    
+    Client -->|HTTPS POST| POST
     POST --> ME
-    ME --> Model
-    Model --> Explainer
-    Explainer --> Response
-    ME -.-> Response
-    Model -.-> Response
+    ME -->|Extracted Features| Model
+    Model -->|Pred + Probabilities| Explainer
+    Explainer -->|SHAP| Response
+    ME -.->|Metadata| Response
+    Model -.->|Pred/Proba| Response
     Response --> Output
-    Output --> Client
+    Output -->|HTTPS Response| Client
 ```
 
 ---
 
-### **B. How It Fits into e6data Execution Pipeline (Concept)**
+### **How This Fits Into e6data’s Ecosystem**
 
 ```mermaid
 %%{init: {'theme':'dark'}}%%
 graph TB
     User[User SQL UI / API]
-    Gateway[Query Control Plane]
-    Risk[Query-Risk Microservice]
+    Gateway[Query Control Plane / Gateway]
+    Risk[Query-Risk Microservice<br/>Risk Score + Advice]
+    
     Planner[Execution Planner]
     Engine[e6data Execution Engine]
-    Storage[S3 / ADLS / GCS]
+    Storage[Object Storage]
 
-    Telemetry[Telemetry Stream]
+    Telemetry[Telemetry + Logging]
     Obs[Observability Pipeline]
-    DS[Datastore / Labeling Queue]
-
-    User --> Gateway
-    Gateway -->|Pre-execution Hook| Risk
-
-    Risk -->|High Risk → Block/Warn| Gateway
-    Risk -->|Safe → Continue| Planner
-
+    Data[Datastore / Labeling Queue]
+    
+    User -->|Submit SQL| Gateway
+    Gateway -->|Pre-exec Hook| Risk
+    
+    Risk -->|High Risk → Warn/Block| Gateway
+    Risk -->|Safe → Pass| Planner
+    
     Planner --> Engine
     Engine --> Storage
-
+    
     Planner --> Telemetry
     Telemetry --> Obs
-    Obs --> DS
+    Obs --> Data
 ```
 
 ---
 
-# **4. Output Example**
+## **3. Quick User Flow**
 
-Input:
-
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart LR
+    A[User submits SQL] --> B[Risk Service]
+    B --> C[Metadata Extractor<br/>Parse SQL → counts, sizes, flags]
+    C --> D[Model<br/>Predict low/med/high]
+    C -->|Structural violation| F[Rule Override → High Risk]
+    D --> E[SHAP Explainer<br/>Why this score]
+    E --> G[Build JSON Response]
+    F --> G
+    D --> G
+    C --> G
+    G --> H[Return: risk + metadata + explanation]
 ```
-SELECT * FROM big_sales_table WHERE amount > 500;
-```
-
-Output:
-
-```json
-{
-  "prediction": 1,
-  "probabilities": [
-    0.0,
-    0.977115619501889,
-    0.022884380498110934
-  ],
-  "metadata": {
-    "num_tables": 1,
-    "num_joins": 0,
-    "num_filters": 0,
-    "num_subqueries": 0,
-    "subquery_depth": 0,
-    "num_aggregates": 0,
-    "has_groupby": 0,
-    "has_orderby": 0,
-    "has_limit": 0,
-    "select_star": 1,
-    "window_functions": 0,
-    "udf_usage": 0,
-    "s3_scan": 0,
-    "cartesian_join": 0,
-    "query_length": 30,
-    "estimated_table_size_max": 10000000,
-    "estimated_join_output": 10000000,
-    "estimated_output_rows": 10000000,
-    "estimated_sort_cost": 232534966.64211535,
-    "select_star_columns_estimate": 4
-  },
-  "shap": null
-}
-```
-
-If the query triggers a catastrophic pattern:
-
-* Cartesian Join (`ON 1=1`, `CROSS JOIN`)
-* SELECT * on massive tables
-* Explosive fan-out joins
-
-The rule layer overrides the model and returns:
-
-```
-prediction: High
-```
-
-Every time. Deterministic.
 
 ---
 
-# **5. Why This Matters (for e6data)**
+## **4. Why This Matters (Business Value)**
 
-* **Prevents cluster blow-ups** caused by naive SELECT * or accidental cartesian joins
-* **Protects the execution engine** from unbounded scans
-* **Gives instant feedback** before the planner even touches the query
-* **Adds explainability** (SHAP + rule-layer) so users understand *why*
-* **Paves the way for an autonomous cost-based gatekeeper** inside e6data’s control plane
-* Works as a **lightweight microservice** the engine can call synchronously
+This PoC demonstrates a **pre-execution risk layer** that protects the engine from bad SQL before it burns compute.
 
-This PoC is designed to be extended into a production policy layer.
+### **1. Cost Control**
+
+Stops unbounded scans, cross-joins, and SELECT * on massive tables before execution.
+Direct reduction in compute waste and autoscaling spikes.
+
+### **2. More Stable Clusters**
+
+Bad queries cripple latency and disrupt co-tenancy.
+Flagging them early keeps workloads smooth and predictable.
+
+### **3. Path to Autonomous Governance**
+
+This scoring loop becomes the base for:
+
+* continuous telemetry ingestion
+* weekly retraining with new patterns
+* automated guardrails for different customer tiers
+
+A differentiated capability that positions e6data as *proactive* rather than reactive.
 
 ---
 
-# **6. Running It Locally**
+## **5. Running the PoC**
 
-### Install
+### **Install**
 
 ```
 pip install -r requirements.txt
 ```
 
-### Train
+### **Train**
 
 ```
 python train_model.py
 ```
 
-### Run interactive inference
+### **Single Inference**
 
 ```
-python infer.py "SELECT * FROM users"
+python infer.py "SELECT * FROM big_sales_table WHERE amount > 500"
 ```
 
-### Batch test (60 curated SQL queries)
+### **Batch Testing**
 
 ```
 python batch_infer.py
 ```
 
-### Streamlit UI
-
-```
-streamlit run app_streamlit.py
-```
+(Default = `test_queries.txt`)
 
 ---
 
-# **7. Files Overview**
+## **6. Streamlit UI**
 
 ```
-metadata_extractor.py    → SQL parsing + cost signals
-train_model.py           → XGBoost training + calibration
-infer.py                 → Model inference + SHAP + rule overrides
-batch_infer.py           → Test queries runner
-app_streamlit.py         → UI to demo scoring
-synthetic.csv            → Training data
-tables_config.py         → Table sizes/types used for metadata estimation
+python app_streamlit.py
 ```
 
-If you want adjustments (more concise, more bold, more technical, less technical), tell me and I’ll tailor it exactly to your pitch style.
+Shows:
+
+* risk level
+* metadata
+* probabilities
+* SHAP explanations (when available)
+
+---
+
+## **7. What’s Next (Optional Enhancements)**
+
+* Plug into control plane as a real pre-execution hook
+* Build telemetry → retrain loop
+* Improve metadata richness via real engine stats
+* Expand SHAP for customer-facing transparency
+
+---
+
+## **8. Folder Structure (Clean & Simple)**
+
+```
+query_risk_poc/
+  ├── train_model.py
+  ├── infer.py
+  ├── batch_infer.py
+  ├── metadata_extractor.py
+  ├── tables_config.py
+  ├── synthetic_generator.py
+  ├── synthetic_v3.csv
+  ├── test_queries.txt
+  ├── xgb_query_risk.joblib
+  ├── app_streamlit.py
+  └── README.md
+```
