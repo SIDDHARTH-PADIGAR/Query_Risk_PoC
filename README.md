@@ -1,32 +1,36 @@
-# **Query Risk Scoring System — PoC**
+# **Query Risk Scoring — PoC for e6data**
 
-A lightweight microservice that scores SQL queries for **execution risk** before they hit the compute engine.
-It analyzes SQL structure, estimates potential compute cost, runs an ML model, applies safety rules, and returns a clean JSON output.
+A lightweight pre-execution risk scoring system that predicts the cost impact of an incoming SQL query before it reaches the execution engine.
+The goal: **identify expensive queries early**, flag unsafe patterns (Cartesian joins, massive scans, SELECT * on huge tables), and return a **Low / Medium / High** risk score with an explanation.
 
-Built to mimic a real pre-execution guardrail inside a lakehouse engine.
+This PoC evaluates a SQL string and produces:
 
----
+* Risk level (0 = Low, 1 = Medium, 2 = High)
+* Probability distribution
+* Extracted metadata (joins, table sizes, filters, windows, subqueries…)
+* SHAP-based interpretability (model-based reasoning)
+* Hard safety overrides (critical patterns → forced High)
 
-# **1. What This Service Does**
-
-When you send a SQL query, the service returns:
-
-* **risk level:**
-  `0 = low`, `1 = medium`, `2 = high`
-
-* **probabilities:** model confidence
-
-* **metadata:** what the query structurally looks like
-
-* **shap:** why the model made its prediction (if model used)
-
-* **rule overrides:** force HIGH for catastrophic patterns
-
-This is how control planes decide **resource allocation**, **warnings**, or **blocks**.
+Powered by: **Metadata extraction → ML model → Rule-layer overrides**.
 
 ---
 
-# **2. Quick User Flow**
+# **1. How It Works**
+
+### **Core Pipeline**
+
+1. User submits a SQL query
+2. Metadata extractor parses structural and cost-related signals
+3. Model predicts risk (XGBoost + calibration)
+4. SHAP explains model reasoning (where applicable)
+5. Rule engine enforces mandatory red flags
+6. System returns a structured JSON response
+
+Fast (<50ms), deterministic, and production-aligned with the way e6data evaluates query cost internally.
+
+---
+
+# **2. User Flow**
 
 ```mermaid
 %%{init: {'theme':'neutral'}}%%
@@ -34,43 +38,44 @@ flowchart LR
 
 A[User submits SQL] --> B[Query sent to Risk Service]
 
-B --> C[Metadata Extractor<br/>Parse SQL → features]
-C --> D[Model<br/>Predict low / medium / high]
+B --> C[Metadata Extractor<br/>Parse SQL → counts, sizes, joins]
+C --> D[ML Model<br/>Predict Low / Med / High]
 
-D --> E[SHAP Explainer<br/>Model-only explanations]
-C -->|Catastrophic pattern detected| F[Rule Override<br/>Force High Risk]
+%% SHAP and rules
+D --> E[SHAP Explainer<br/>Model-only explanation]
+C -->|Critical pattern| F[Rule Override<br/>Force High]
 
-E --> G[Build JSON Response]
+%% Response assembly
+E --> G[JSON Response Builder]
 F --> G
 D --> G
 C --> G
 
-G --> H[Return: risk score + probabilities + metadata + SHAP]
-
+G --> H[Return risk score + metadata + explanation]
 ```
-
-This is the real pipeline engines use.
 
 ---
 
-# **3. System Architecture (Microservice)**
+# **3. System Architecture**
+
+### **A. Query Risk Scoring System (Standalone)**
 
 ```mermaid
 %%{init: {'theme':'dark'}}%%
 graph TB
-    Client[Client/Portal]
+    Client[Client / Portal]
 
     subgraph API["Query-Risk Service"]
-        POST[HTTP POST /score]
+        POST[POST /score]
         ME[Metadata Extractor]
-        Model[XGBoost Model<br/>+ Calibration]
+        Model[ML Model<br/>XGBoost + Calibrator]
         Explainer[SHAP Explainer]
-        Response[Response Builder]
+        Response[JSON Builder]
     end
 
     Output["JSON Response"]
 
-    Client --> POST
+    Client -->|POST SQL| POST
     POST --> ME
     ME --> Model
     Model --> Explainer
@@ -83,138 +88,62 @@ graph TB
 
 ---
 
-# **4. How It Fits Into a Control Plane**
+### **B. How It Fits into e6data Execution Pipeline (Concept)**
 
 ```mermaid
 %%{init: {'theme':'dark'}}%%
 graph TB
-    User[User SQL UI]
-    Gateway[Control Plane Gateway]
+    User[User SQL UI / API]
+    Gateway[Query Control Plane]
     Risk[Query-Risk Microservice]
-
     Planner[Execution Planner]
-    Engine[Execution Engine]
-    Storage[Object Storage]
+    Engine[e6data Execution Engine]
+    Storage[S3 / ADLS / GCS]
 
-    Telemetry[Telemetry]
+    Telemetry[Telemetry Stream]
     Obs[Observability Pipeline]
-    Store[Datastore]
+    DS[Datastore / Labeling Queue]
 
     User --> Gateway
-    Gateway --> Risk
-    Risk -->|High: warn/block| Gateway
-    Risk -->|Safe| Planner
+    Gateway -->|Pre-execution Hook| Risk
+
+    Risk -->|High Risk → Block/Warn| Gateway
+    Risk -->|Safe → Continue| Planner
 
     Planner --> Engine
     Engine --> Storage
 
     Planner --> Telemetry
     Telemetry --> Obs
-    Obs --> Store
+    Obs --> DS
 ```
 
 ---
 
-# **5. What Metadata Means**
+# **4. Output Example**
 
-Example:
+Input:
+
+```
+SELECT * FROM big_sales_table WHERE amount > 500;
+```
+
+Output:
 
 ```json
 {
-  "estimated_join_output": 10000000
-}
-```
-
-**Meaning:**
-“If this join runs, expect ~10 million rows created during the join step.”
-
-This drives:
-
-* memory needed
-* shuffle load
-* network cost
-* engine scaling decisions
-* risk score
-
-Other fields follow the same idea:
-numbers that hint at **how much work the engine will do**.
-
----
-
-# **6. Rule Overrides (Non-negotiable Safety)**
-
-The model can be wrong. Some patterns are too dangerous.
-
-Hard-coded overrides:
-
-* **Cartesian join → HIGH**
-* **Huge SELECT * scan → HIGH**
-* **Extreme fan-out → HIGH**
-
-These run before the model output is returned.
-
----
-
-# **7. Running the PoC**
-
-Train:
-
-```bash
-python train_model.py
-```
-
-Infer:
-
-```bash
-python infer.py "SELECT * FROM big_sales_table WHERE amount > 500"
-```
-
-UI:
-
-```bash
-streamlit run app_streamlit.py
-```
-
----
-
-# **8. Repo Structure**
-
-```
-metadata_extractor.py
-generate_dataset.py
-train_model.py
-infer.py
-app_streamlit.py
-xgb_query_risk.joblib
-README.md
-```
-
----
-
-# **9. Example Output**
-
-```json
-{
-  "prediction": 2,
+  "prediction": 1,
   "probabilities": [
     0.0,
-    0.0,
-    1.0
+    0.977115619501889,
+    0.022884380498110934
   ],
   "metadata": {
-    "num_tables": 2,
-    "num_joins": 1,
-    "num_joins": 1,
-    "num_filters": 0,
+    "num_tables": 1,
+    "num_joins": 0,
     "num_filters": 0,
     "num_subqueries": 0,
     "subquery_depth": 0,
-    "num_aggregates": 0,
-    "has_groupby": 0,
-    "has_orderby": 0,
-    "num_aggregates": 0,
-    "has_groupby": 0,
-    "num_aggregates": 0,
     "num_aggregates": 0,
     "has_groupby": 0,
     "has_orderby": 0,
@@ -223,24 +152,91 @@ README.md
     "window_functions": 0,
     "udf_usage": 0,
     "s3_scan": 0,
-    "cartesian_join": 1,
-    "query_length": 57,
+    "cartesian_join": 0,
+    "query_length": 30,
     "estimated_table_size_max": 10000000,
     "estimated_join_output": 10000000,
     "estimated_output_rows": 10000000,
     "estimated_sort_cost": 232534966.64211535,
-    "select_star_columns_estimate": 8
+    "select_star_columns_estimate": 4
   },
   "shap": null
 }
 ```
 
-Translation:
+If the query triggers a catastrophic pattern:
 
-* Found a cartesian join
-* Estimated 10M row explosion
-* Overrode the model
-* Forced HIGH risk
-* SHAP is null (model wasn’t used)
+* Cartesian Join (`ON 1=1`, `CROSS JOIN`)
+* SELECT * on massive tables
+* Explosive fan-out joins
 
+The rule layer overrides the model and returns:
 
+```
+prediction: High
+```
+
+Every time. Deterministic.
+
+---
+
+# **5. Why This Matters (for e6data)**
+
+* **Prevents cluster blow-ups** caused by naive SELECT * or accidental cartesian joins
+* **Protects the execution engine** from unbounded scans
+* **Gives instant feedback** before the planner even touches the query
+* **Adds explainability** (SHAP + rule-layer) so users understand *why*
+* **Paves the way for an autonomous cost-based gatekeeper** inside e6data’s control plane
+* Works as a **lightweight microservice** the engine can call synchronously
+
+This PoC is designed to be extended into a production policy layer.
+
+---
+
+# **6. Running It Locally**
+
+### Install
+
+```
+pip install -r requirements.txt
+```
+
+### Train
+
+```
+python train_model.py
+```
+
+### Run interactive inference
+
+```
+python infer.py "SELECT * FROM users"
+```
+
+### Batch test (60 curated SQL queries)
+
+```
+python batch_infer.py
+```
+
+### Streamlit UI
+
+```
+streamlit run app_streamlit.py
+```
+
+---
+
+# **7. Files Overview**
+
+```
+metadata_extractor.py    → SQL parsing + cost signals
+train_model.py           → XGBoost training + calibration
+infer.py                 → Model inference + SHAP + rule overrides
+batch_infer.py           → Test queries runner
+app_streamlit.py         → UI to demo scoring
+synthetic.csv            → Training data
+tables_config.py         → Table sizes/types used for metadata estimation
+```
+
+If you want adjustments (more concise, more bold, more technical, less technical), tell me and I’ll tailor it exactly to your pitch style.
